@@ -42,6 +42,28 @@ checkAndCopyConfigFiles();
 // 初始加载
 loadEnv();
 
+function detectNodeDeployPlatform() {
+  if (process.env.SPACE_ID) {
+    return "huggingface";
+  }
+  return "node";
+}
+
+function resolvePublicRequestProtocol(req) {
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  if (forwardedProto === 'http' || forwardedProto === 'https') {
+    return forwardedProto;
+  }
+
+  const configuredProto = String(process.env.DANMU_API_PUBLIC_PROTO || 'http')
+    .trim()
+    .toLowerCase();
+  return configuredProto === 'https' ? 'https' : 'http';
+}
+
 /**
  * 检查并自动复制配置文件
  * 在Node环境下，如果config目录下没有.env，则自动从.env.example拷贝一份生成.env
@@ -189,9 +211,9 @@ async function setupEnvWatcher() {
           console.log('[server] Environment variables reloaded successfully');
           console.log('[server] Updated keys:', Array.from(newEnvKeys).join(', '));
 
-          // 如果检测到关闭了 Bangumi Data 功能，主动释放 V8 内存
+          // 如果检测到关闭了 Bangumi Data 功能，主动释放内存与物理磁盘缓存
           if (process.env.USE_BANGUMI_DATA === 'false' || process.env.USE_BANGUMI_DATA === false) {
-              clearBangumiDataCache();
+              clearBangumiDataCache(true);
           }
 
         } catch (error) {
@@ -263,8 +285,9 @@ process.on('SIGINT', cleanupWatcher);
 function createServer() {
   return http.createServer(async (req, res) => {
     try {
-      // 构造完整的请求 URL
-      const fullUrl = `http://${req.headers.host}${req.url}`;
+      // 构造完整的请求 URL，反向代理场景优先使用客户端原始协议
+      const scheme = resolvePublicRequestProtocol(req);
+      const fullUrl = `${scheme}://${req.headers.host}${req.url}`;
 
       // 获取请求客户端的ip，兼容反向代理场景
       let clientIp = 'unknown';
@@ -306,8 +329,8 @@ function createServer() {
         body: body || undefined, // 对于 GET/HEAD 等请求，body 为 undefined
       });
 
-      // 调用核心处理函数，并标识平台为 "node"
-      const webResponse = await handleRequest(webRequest, process.env, "node", clientIp);
+      // 调用核心处理函数，并标识当前部署平台
+      const webResponse = await handleRequest(webRequest, process.env, detectNodeDeployPlatform(), clientIp);
 
       // 将 Web API Response 对象转换为 Node.js 响应
       res.statusCode = webResponse.status;

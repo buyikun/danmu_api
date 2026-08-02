@@ -7,7 +7,9 @@ import { formatDanmuResponse } from "./utils/danmu-util.js";
 import AIClient from './utils/ai-util.js';
 import { initBangumiData } from "./utils/bangumi-data-util.js";
 import { getBangumi, getComment, getCommentByUrl, getSegmentComment, matchAnime, searchAnime, searchEpisodes } from "./apis/dandan-api.js";
-import { handleConfig, handleUI, handleLogs, handleClearLogs, handleDeploy, handleClearCache, handleReqRecords } from "./apis/system-api.js";
+import { getFongmiDanmaku } from "./apis/clients/fongmi-api.js";
+import { handleConfig, handleUI, handleLogs, handleClearLogs, handleDeploy, handleClearCache, handleReqRecords, handleCacheAnimes } from "./apis/system-api.js";
+import { handleForwardTrace } from "./apis/forward-trace-api.js";
 import { handleSetEnv, handleAddEnv, handleDelEnv, handleAiVerify } from "./apis/env-api.js";
 import { Segment } from "./models/dandan-model.js"
 import {
@@ -29,7 +31,7 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
   const method = req.method;
 
   //  Bangumi Data 辅助函数，用于判断数据更新
-  const isDataDependentRequest = path.includes('/search') || path.includes('/match');
+  const isDataDependentRequest = path.includes('/search') || path.includes('/match') || path.includes('/danmaku');
 
   if (globals.useBangumiData) {
       await initBangumiData(deployPlatform, isDataDependentRequest, ctx);
@@ -56,15 +58,15 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
     }
   }
 
-  log("info", `request url: ${JSON.stringify(url)}`);
-  log("info", `request path: ${path}`);
-  log("info", `client ip: ${clientIp}`);
+  log("info", `[system] [server] request url: ${JSON.stringify(url)}`);
+  log("info", `[system] [server] request path: ${path}`);
+  log("info", `[system] [server] client ip: ${clientIp}`);
 
   // --- IP 黑名单拦截 ---
   if (globals.ipBlacklist?.length) {
     const isBlocked = globals.ipBlacklist.some(rule => matchIpBlacklistRule(rule, clientIp));
     if (isBlocked) {
-      log("warn", `[IP Blacklist] Blocked request from IP: ${clientIp}`);
+      log("warn", `[system] [IP Blacklist] Blocked request from IP: ${clientIp}`);
       return jsonResponse(
         { errorCode: 403, success: false, errorMessage: "Forbidden" },
         403
@@ -75,7 +77,7 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
   // --- 校验 token ---
   const parts = path.split("/").filter(Boolean); // 去掉空段
 
-  const knownApiPaths = ["api", "v1", "v2", "search", "match", "bangumi", "comment"];
+  const knownApiPaths = ["api", "v1", "v2", "search", "match", "bangumi", "comment", "danmaku"];
 
   const firstPart = parts[0] || "";
   const isDefaultToken = globals.token === "87654321";
@@ -103,6 +105,8 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
     '/api/v2/search/anime',
     '/api/v2/match',
     '/api/v2/search/episodes',
+    '/api/v2/fongmi/danmaku',
+    '/danmaku',
     '/api/v2/bangumi',
     '/api/v2/comment',
     '/api/v2/segmentcomment'
@@ -117,8 +121,8 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
 
     if (lastRecord) {
       const lastDate = new Date(lastRecord.timestamp).toDateString();
-      console.log("currentDate: ", currentDate);
-      console.log("lastDate: ", lastDate);
+      log("info", `[system] [server] currentDate: ${currentDate}`);
+      log("info", `[system] [server] lastDate: ${lastDate}`);
       if (lastDate !== currentDate) {
         // 新的一天，重置计数
         globals.todayReqNum = 1;
@@ -206,7 +210,7 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
         }
         // 第一段不是已知的 API 路径，可能是错误的 token
         // 返回 401
-        log("error", `Invalid token in path: ${path}`);
+        log("error", `[system] [server] Invalid token in path: ${path}`);
         return jsonResponse(
           { errorCode: 401, success: false, errorMessage: "Unauthorized" },
           401
@@ -221,7 +225,7 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
       if (path === "/api/config" && method === "GET") {
         return handleConfig(false); // 无权限
       }
-      log("error", `Invalid or missing token in path: ${path}`);
+      log("error", `[system] [server] Invalid or missing token in path: ${path}`);
       return jsonResponse(
         { errorCode: 401, success: false, errorMessage: "Unauthorized" },
         401
@@ -229,6 +233,13 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
     }
     // 移除 token 部分，剩下的才是真正的路径
     path = "/" + parts.slice(1).join("/");
+  }
+
+  // 兼容部分客户端将自定义弹幕短地址再次拼接官方完整路径的情况
+  // 例如: /danmaku/api/v2/fongmi/danmaku?name=...&episode=...
+  if (path.endsWith("/danmaku/api/v2/fongmi/danmaku")) {
+    log("info", `[system] [path fix] Collapsed nested danmaku path: "${path}" -> "/danmaku"`);
+    path = "/danmaku";
   }
 
   // GET /api/config - 获取配置信息 (需要 token)
@@ -241,29 +252,29 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
     return handleReqRecords();
   }
 
-  log("info", path);
+  log("info", `[system] [server] ${path}`);
 
   // 智能处理API路径前缀，确保最终有一个正确的 /api/v2
-  if (path !== "/" && path !== "/api/logs" && !path.startsWith('/api/env') 
+  if (path !== "/" && path !== "/danmaku" && path !== "/api/logs" && !path.startsWith('/api/env') 
     && !path.startsWith('/api/deploy') && !path.startsWith('/api/cache')
     && !path.startsWith('/api/cookie') && !path.startsWith('/api/config')
-    && !path.startsWith('/api/ai')) {
-      log("info", `[Path Check] Starting path normalization for: "${path}"`);
+    && !path.startsWith('/api/ai') && !path.startsWith('/api/debug')) {
+      log("info", `[system] [path check] Starting path normalization for: "${path}"`);
       const pathBeforeCleanup = path; // 保存清理前的路径检查是否修改
 
       // 清理：应对"用户填写/api/v2"+"客户端添加/api/v2"导致的重复前缀
       path = path.replace(/\/+/g, '/');
       while (path.startsWith('/api/v2/api/v2/')) {
-          log("info", `[Path Check] Found redundant /api/v2 prefix. Cleaning...`);
+          log("info", `[system] [path check] Found redundant /api/v2 prefix. Cleaning...`);
           // 从第二个 /api/v2 的位置开始截取，相当于移除第一个
           path = path.substring('/api/v2'.length);
       }
 
       // 打印日志：只有在发生清理时才显示清理后的路径，否则显示"无需清理"
       if (path !== pathBeforeCleanup) {
-          log("info", `[Path Check] Path after cleanup: "${path}"`);
+          log("info", `[system] [path check] Path after cleanup: "${path}"`);
       } else {
-          log("info", `[Path Check] Path after cleanup: No cleanup needed.`);
+          log("info", `[system] [path check] Path after cleanup: No cleanup needed.`);
       }
 
       // 补全：如果路径缺少前缀（例如请求原始路径为 /search/anime 或 /v2/search/anime），则智能补全
@@ -271,25 +282,25 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
       if (!path.startsWith('/api/v2') && path !== '/' && !path.startsWith('/api/logs') 
         && !path.startsWith('/api/env') && !path.startsWith('/api/cache')
         && !path.startsWith('/api/cookie') && !path.startsWith('/api/config')
-        && !path.startsWith('/api/ai')) {
+        && !path.startsWith('/api/ai') && !path.startsWith('/api/debug')) {
           if (path.startsWith('/v2/') || path === '/v2') {
-              log("info", `[Path Check] Path is missing /api prefix. Adding /api...`);
+              log("info", `[system] [path check] Path is missing /api prefix. Adding /api...`);
               path = '/api' + path;
           } else if (path.startsWith('/api/') || path === '/api') {
-              log("info", `[Path Check] Path is missing /v2 prefix. Adding /v2...`);
+              log("info", `[system] [path check] Path is missing /v2 prefix. Adding /v2...`);
               path = '/api/v2' + path.substring(4);
           } else {
-              log("info", `[Path Check] Path is missing /api/v2 prefix. Adding /api/v2...`);
+              log("info", `[system] [path check] Path is missing /api/v2 prefix. Adding /api/v2...`);
               path = '/api/v2' + (path.startsWith('/') ? path : '/' + path);
           }
       }
 
       // 打印日志：只有在发生添加前缀时才显示添加后的路径，否则显示"无需补全"
       if (path === pathBeforePrefixCheck) {
-          log("info", `[Path Check] Prefix Check: No prefix addition needed.`);
+          log("info", `[system] [path check] Prefix Check: No prefix addition needed.`);
       }
 
-      log("info", `[Path Check] Final normalized path: "${path}"`);
+      log("info", `[system] [path check] Final normalized path: "${path}"`);
   }
 
   // GET /
@@ -305,6 +316,16 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
   // GET /api/v2/search/episodes
   if (path === "/api/v2/search/episodes" && method === "GET") {
     return searchEpisodes(url);
+  }
+
+  // GET|POST /api/v2/fongmi/danmaku
+  if (path === "/api/v2/fongmi/danmaku" && (method === "GET" || method === "POST")) {
+    return getFongmiDanmaku(url, req);
+  }
+
+  // GET|POST /danmaku
+  if (path === "/danmaku" && (method === "GET" || method === "POST")) {
+    return getFongmiDanmaku(url, req);
   }
 
   // GET /api/v2/match
@@ -336,7 +357,7 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
       // 先检查缓存
       const cachedComments = getCommentCache(videoUrl);
       if (cachedComments !== null) {
-        log("info", `[Rate Limit] Cache hit for URL: ${videoUrl}, skipping rate limit check`);
+        log("info", `[system] [Rate Limit] Cache hit for URL: ${videoUrl}, skipping rate limit check`);
         return getCommentByUrl(videoUrl, queryFormat, segmentFlag, includeDuration);
       }
 
@@ -358,7 +379,7 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
 
         // 如果最近 1 分钟内的请求次数超过限制，返回 429 错误
         if (recentRequests.length >= globals.rateLimitMaxRequests) {
-          log("warn", `[Rate Limit] IP ${clientIp} exceeded rate limit (${recentRequests.length}/${globals.rateLimitMaxRequests} requests in 1 minute)`);
+          log("warn", `[system] [Rate Limit] IP ${clientIp} exceeded rate limit (${recentRequests.length}/${globals.rateLimitMaxRequests} requests in 1 minute)`);
           return jsonResponse(
             { errorCode: 429, success: false, errorMessage: "Too many requests, please try again later" },
             429
@@ -368,7 +389,7 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
         // 记录本次请求时间戳
         recentRequests.push(currentTime);
         globals.requestHistory.set(clientIp, recentRequests);
-        log("info", `[Rate Limit] IP ${clientIp} request count: ${recentRequests.length}/${globals.rateLimitMaxRequests}`);
+        log("info", `[system] [Rate Limit] IP ${clientIp} request count: ${recentRequests.length}/${globals.rateLimitMaxRequests}`);
       }
 
       // 通过URL获取弹幕
@@ -377,7 +398,7 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
 
     // 否则通过commentId获取弹幕
     if (!path.startsWith("/api/v2/comment/")) {
-      log("error", "Missing commentId or url parameter");
+      log("error", "[system] [server] Missing commentId or url parameter");
       return jsonResponse(
         { errorCode: 400, success: false, errorMessage: "Missing commentId or url parameter" },
         400
@@ -391,7 +412,7 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
       // 检查弹幕缓存 - 缓存命中时直接返回，不计入限流
       const cachedComments = getCommentCache(urlForComment);
       if (cachedComments !== null) {
-        log("info", `[Rate Limit] Cache hit for URL: ${urlForComment}, skipping rate limit check`);
+        log("info", `[system] [Rate Limit] Cache hit for URL: ${urlForComment}, skipping rate limit check`);
         return getComment(path, queryFormat, segmentFlag, clientIp, includeDuration);
       }
     }
@@ -418,7 +439,7 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
 
       // 如果最近的请求数量大于等于配置的限制次数，则限制请求
       if (recentRequests.length >= globals.rateLimitMaxRequests) {
-        log("warn", `[Rate Limit] IP ${clientIp} exceeded rate limit (${recentRequests.length}/${globals.rateLimitMaxRequests} requests in 1 minute)`);
+        log("warn", `[system] [Rate Limit] IP ${clientIp} exceeded rate limit (${recentRequests.length}/${globals.rateLimitMaxRequests} requests in 1 minute)`);
         return jsonResponse(
           { errorCode: 429, success: false, errorMessage: "Too many requests, please try again later" },
           429
@@ -428,7 +449,7 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
       // 记录本次请求时间戳
       recentRequests.push(currentTime);
       globals.requestHistory.set(clientIp, recentRequests);
-      log("info", `[Rate Limit] IP ${clientIp} request count: ${recentRequests.length}/${globals.rateLimitMaxRequests}`);
+      log("info", `[system] [Rate Limit] IP ${clientIp} request count: ${recentRequests.length}/${globals.rateLimitMaxRequests}`);
     }
 
     return getComment(path, queryFormat, segmentFlag, clientIp, includeDuration);
@@ -446,7 +467,7 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
       try {
         segment = Segment.fromJson(requestBody);
       } catch (e) {
-        log("error", "Invalid JSON in request body for segment");
+        log("error", "[system] [server] Invalid JSON in request body for segment");
         return jsonResponse(
           { errorCode: 400, success: false, errorMessage: "Invalid JSON in request body" },
           400
@@ -456,7 +477,7 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
       // 通过URL和平台获取分段弹幕
       return getSegmentComment(segment, queryFormat);
     } catch (error) {
-      log("error", `Error processing segmentcomment request: ${error.message}`);
+      log("error", `[system] [server] Error processing segmentcomment request: ${error.message}`);
       return jsonResponse(
         { errorCode: 500, success: false, errorMessage: "Internal server error" },
         500
@@ -467,6 +488,15 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
   // GET /api/logs
   if (path === "/api/logs" && method === "GET") {
     return handleLogs();
+  }
+
+  if (path === '/api/debug/forward-trace') {
+    if (!isValidToken) {
+      return jsonResponse({ success: false, errorMessage: 'Explicit token required for Forward traces' }, 401);
+    }
+    if (method === 'POST') {
+      return handleForwardTrace(req);
+    }
   }
 
   // POST /api/logs/clear
@@ -492,6 +522,11 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
   // POST /api/deploy - 重新部署
   if (path === "/api/deploy" && method === "POST") {
     return handleDeploy();
+  }
+
+  // GET /api/cache/animes - 获取最近 animes 缓存
+  if (path === "/api/cache/animes" && method === "GET") {
+    return handleCacheAnimes();
   }
 
   // POST /api/cache/clear - 清理缓存
@@ -645,13 +680,20 @@ function isRunningOnVercel() {
   );
 }
 
+function detectDeployPlatform(env) {
+  if (env?.SPACE_ID || (typeof process !== 'undefined' && process.env?.SPACE_ID)) {
+    return "huggingface";
+  }
+  return isRunningOnVercel() ? "vercel" : "cloudflare";
+}
+
 // --- Cloudflare Workers 入口 ---
 export default {
   async fetch(request, env, ctx) {
     // 获取客户端的真实 IP
     const clientIp = request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || 'unknown';
 
-    return handleRequest(request, env, isRunningOnVercel() ? "vercel" : "cloudflare", clientIp, ctx);
+    return handleRequest(request, env, detectDeployPlatform(env), clientIp, ctx);
   },
 };
 
